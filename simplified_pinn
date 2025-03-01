@@ -1,0 +1,512 @@
+import torch
+import torch.nn as nn
+import numpy as np
+
+class SimplifiedPINN(nn.Module):
+    """
+    Simplified Physics-informed neural network for LMD temperature prediction.
+    This version focuses on numerical stability and basic physics based on the paper.
+    """
+    def __init__(self, domain_bounds, laser_params=None):
+        super(SimplifiedPINN, self).__init__()
+        self.domain_bounds = domain_bounds
+        
+        # Physical parameters from Table 2 in the paper
+        self.T_ambient = 293.15  # Initial/ambient temperature in K
+        self.T_ref = 1690.0 - self.T_ambient  # Reference temperature difference (liquidus - ambient)
+        self.T_solidus = 1730.0  # Solidus temperature
+        self.density = 7780.0    # kg/m^3 for Ti-6Al-4V from paper
+        
+        # Convection and radiation coefficients from paper
+        self.h_c = 20.0  # Convection coefficient (W/m²K)
+        self.epsilon = 0.85  # Radiation coefficient 
+        self.sigma = 5.67e-8  # Stefan-Boltzmann constant (W/m²K⁴)
+        
+        # Laser parameters from Table 2
+        if laser_params is None:
+            self.laser_params = {
+                'power': 2000.0,     # W
+                'velocity': 8.0,     # mm/s, converted to m/s in calculations
+                'absorption': 0.75,  # Absorption coefficient
+                'Ra': 3.0,           # Semi-axis in x-direction (mm)
+                'Rb': 3.0,           # Semi-axis in y-direction (mm)
+                'Rc': 1.0,           # Semi-axis in z-direction (mm)
+                'start_pos': [0.0, 0.01],  # Start at the left middle (m)
+                'end_pos': [0.04, 0.01]    # End at the right middle (m)
+            }
+        else:
+            self.laser_params = laser_params
+        
+        # Simple neural network - 3 layers with larger width for better expressive power
+        self.net = nn.Sequential(
+            nn.Linear(4, 128),  # [x, y, z, t] -> 128
+            nn.Tanh(),
+            nn.Linear(128, 128),
+            nn.Tanh(), 
+            nn.Linear(128, 1)   # Single output for temperature
+        )
+        
+        # Initialize weights to allow learning larger temperature changes
+        self._init_weights()
+        
+        # Stage indicator - 'deposition' or 'cooling'
+        self.stage = 'deposition'
+    
+    def _init_weights(self):
+        """Initialize weights with larger values for better learning"""
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                # Use xavier initialization for better signal propagation
+                nn.init.xavier_normal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    m.bias.data.zero_()
+    
+    def _thermal_conductivity(self, T):
+        """
+        Temperature-dependent thermal conductivity (W/m·K) from paper Table 2:
+        k = 2.0×10⁻⁵T² - 0.0444T + 49.94 (T < 1773.15 K)
+        k = 1.04×10⁻⁴T² - 0.3426T + 314.2 (T ≥ 1773.15 K)
+        """
+        k = torch.zeros_like(T)
+        
+        # Use the piecewise function from the paper
+        mask_below = T < 1773.15
+        mask_above = ~mask_below
+        
+        # Values below solidus temperature
+        k[mask_below] = 2.0e-5 * T[mask_below]**2 - 0.0444 * T[mask_below] + 49.94
+        
+        # Values above solidus temperature
+        k[mask_above] = 1.04e-4 * T[mask_above]**2 - 0.3426 * T[mask_above] + 314.2
+        
+        return k
+    
+    def _specific_heat(self, T):
+        """
+        Temperature-dependent specific heat capacity (J/kg·K) from paper Table 2:
+        C_p = 0.4422 + 2.25×10⁻⁴T (T < 1268 K)
+        C_p = 0.855 - 3.91×10⁻⁴T (T ≥ 1268 K)
+        
+        Note: Values are converted from cal/(g·K) to J/(kg·K) by multiplying by 4184
+        """
+        cp = torch.zeros_like(T)
+        
+        # Values below and above the transition temperature (1268 K)
+        mask_below = T < 1268.0
+        mask_above = ~mask_below
+        
+        # Apply the appropriate formula for each temperature range
+        cp[mask_below] = 0.4422 + 2.25e-4 * T[mask_below]  # T < 1268 K
+        cp[mask_above] = 0.855 - 3.91e-4 * T[mask_above]   # T ≥ 1268 K
+        
+        # Convert from cal/(g·K) to J/(kg·K) (multiply by 4184)
+        cp = cp * 4184.0
+        
+        return cp
+    
+    def normalize_input(self, x, y, z, t):
+        """Normalize inputs to [-1,1] range for better neural network performance"""
+        x_min, x_max = self.domain_bounds['x_min'], self.domain_bounds['x_max']
+        y_min, y_max = self.domain_bounds['y_min'], self.domain_bounds['y_max']
+        z_min, z_max = self.domain_bounds['z_min'], self.domain_bounds['z_max']
+        t_min = self.domain_bounds['t_min']
+        t_max = self.domain_bounds['t_max_deposition'] if self.stage == 'deposition' else self.domain_bounds['t_max_cooling']
+        
+        # Simple linear scaling to [-1,1]
+        x_norm = 2.0 * (x - x_min) / (x_max - x_min) - 1.0
+        y_norm = 2.0 * (y - y_min) / (y_max - y_min) - 1.0
+        z_norm = 2.0 * (z - z_min) / (z_max - z_min) - 1.0
+        t_norm = 2.0 * (t - t_min) / (t_max - t_min) - 1.0
+        
+        return x_norm, y_norm, z_norm, t_norm
+    
+    def forward(self, x, y, z, t):
+        """Forward pass to predict temperature"""
+        # Normalize inputs
+        x_norm, y_norm, z_norm, t_norm = self.normalize_input(x, y, z, t)
+        inputs = torch.cat([x_norm, y_norm, z_norm, t_norm], dim=1)
+        
+        # Get network output (a scalar value)
+        output = self.net(inputs)
+        
+        # Direct mapping to temperature (ambient + learned change)
+        # Simple scaling with larger range to capture high temperatures
+        T = self.T_ambient + 2500.0 * torch.sigmoid(output)
+        
+        return T
+    
+    def compute_derivatives(self, x, y, z, t):
+        """
+        Compute derivatives of temperature with respect to spatial coordinates and time
+        using automatic differentiation - following Eq. (1) from the paper
+        """
+        x.requires_grad_(True)
+        y.requires_grad_(True)
+        z.requires_grad_(True)
+        t.requires_grad_(True)
+        
+        # Forward pass
+        T = self.forward(x, y, z, t)
+        
+        # First-order derivatives
+        grad_outputs = torch.ones_like(T)
+        
+        dT_dx = torch.autograd.grad(
+            T, x, grad_outputs=grad_outputs, create_graph=True, retain_graph=True
+        )[0]
+        
+        dT_dy = torch.autograd.grad(
+            T, y, grad_outputs=grad_outputs, create_graph=True, retain_graph=True
+        )[0]
+        
+        dT_dz = torch.autograd.grad(
+            T, z, grad_outputs=grad_outputs, create_graph=True, retain_graph=True
+        )[0]
+        
+        dT_dt = torch.autograd.grad(
+            T, t, grad_outputs=grad_outputs, create_graph=True, retain_graph=True
+        )[0]
+        
+        # Second-order derivatives
+        d2T_dx2 = torch.autograd.grad(
+            dT_dx, x, grad_outputs=torch.ones_like(dT_dx), create_graph=True, retain_graph=True
+        )[0]
+        
+        d2T_dy2 = torch.autograd.grad(
+            dT_dy, y, grad_outputs=torch.ones_like(dT_dy), create_graph=True, retain_graph=True
+        )[0]
+        
+        d2T_dz2 = torch.autograd.grad(
+            dT_dz, z, grad_outputs=torch.ones_like(dT_dz), create_graph=True, retain_graph=True
+        )[0]
+        
+        return {
+            'T': T,
+            'dT_dx': dT_dx,
+            'dT_dy': dT_dy,
+            'dT_dz': dT_dz,
+            'dT_dt': dT_dt,
+            'd2T_dx2': d2T_dx2,
+            'd2T_dy2': d2T_dy2,
+            'd2T_dz2': d2T_dz2
+        }
+    
+    def heat_source(self, x, y, z, t):
+        """
+        Ellipsoidal heat source model (Qlaser) as described in the paper
+        """
+        # Laser parameters
+        power = self.laser_params['power']  # W
+        absorption = self.laser_params['absorption']
+        
+        # Convert mm to m for calculations
+        Ra = self.laser_params['Ra'] / 1000.0  # m
+        Rb = self.laser_params['Rb'] / 1000.0  # m
+        Rc = self.laser_params['Rc'] / 1000.0  # m
+        velocity = self.laser_params['velocity'] / 1000.0  # Convert mm/s to m/s
+        
+        # Laser path (linear from start to end)
+        start_x, start_y = self.laser_params['start_pos']
+        end_x, end_y = self.laser_params['end_pos']
+        path_length = ((end_x - start_x)**2 + (end_y - start_y)**2)**0.5
+        travel_time = path_length / velocity
+        
+        # Current laser position
+        t_clamped = torch.clamp(t, min=0.0, max=travel_time)
+        fraction = t_clamped / travel_time
+        current_x = start_x + (end_x - start_x) * fraction
+        current_y = start_y + (end_y - start_y) * fraction
+        current_z = torch.zeros_like(t)  # Laser moves on surface (z=0)
+        
+        # Calculate normalized distance for heat source
+        r_squared = ((x - current_x) / Ra)**2 + ((y - current_y) / Rb)**2 + ((z - current_z) / Rc)**2
+        
+        # Heat source intensity based on Gaussian distribution
+        # Q = (3√3η_0P)/(4√π*abc) * exp(-3*r^2)
+        prefactor = (3.0 * np.sqrt(3) * absorption * power) / (4.0 * np.sqrt(np.pi) * Ra * Rb * Rc)
+        Q = prefactor * torch.exp(-3.0 * r_squared)
+        
+        # Turn off heat source after travel time (during cooling stage)
+        Q = torch.where(t > travel_time, torch.zeros_like(Q), Q)
+        
+        return Q
+    
+    def compute_pde_residual(self, x, y, z, t):
+        """
+        Compute PDE residual for the heat conduction equation from Eq. (1) in the paper:
+        ∂(ρCpT)/∂t = ∂/∂x(k∂T/∂x) + Qlaser
+        
+        Simplified with vector calculus as:
+        ρCp∂T/∂t = ∇·(k∇T) + Qlaser
+        """
+        # Compute derivatives
+        derivatives = self.compute_derivatives(x, y, z, t)
+        T = derivatives['T']
+        
+        # Get temperature-dependent material properties
+        k = self._thermal_conductivity(T)
+        cp = self._specific_heat(T)
+        rho = self.density
+        
+        # Compute diffusion term: ∇·(k∇T) ≈ k∇²T
+        laplacian = derivatives['d2T_dx2'] + derivatives['d2T_dy2'] + derivatives['d2T_dz2']
+        diffusion_term = k * laplacian
+        
+        # Compute transient term: ρCp∂T/∂t
+        transient_term = rho * cp * derivatives['dT_dt']
+        
+        # Add heat source term (only for deposition stage)
+        if self.stage == 'deposition':
+            heat_source_term = self.heat_source(x, y, z, t)
+        else:
+            heat_source_term = torch.zeros_like(transient_term)
+        
+        # PDE residual: ρCp∂T/∂t - ∇·(k∇T) - Qlaser = 0
+        residual = transient_term - diffusion_term - heat_source_term
+        
+        # Simple scaling to prevent extreme values
+        scale_factor = torch.mean(torch.abs(transient_term)) + 1e-6
+        residual = residual / scale_factor
+        
+        return residual, T
+    
+    def compute_bc_residual(self, x, y, z, t, boundary_type):
+        """
+        Compute residual for boundary conditions as per Eq. (3) in the paper:
+        - Robin boundary condition: k∂T/∂n + qc + qr = 0
+        - Where qc = h(T-T∞) and qr = εσ(T⁴-T∞⁴)
+        """
+        # For numerical stability, avoid computing boundary conditions initially
+        if self.stage == 'deposition' and t.min() < 0.1:
+            return torch.zeros_like(t), self.forward(x, y, z, t)
+        
+        # Compute temperature
+        T = self.forward(x, y, z, t)
+        
+        # Enable gradient computation
+        x.requires_grad_(True)
+        y.requires_grad_(True)
+        z.requires_grad_(True)
+        
+        # Recompute T to get gradients
+        T = self.forward(x, y, z, t)
+        
+        # Compute temperature gradient
+        grad_T = torch.ones_like(T)
+        
+        if boundary_type == 'top':  # z = z_max
+            dT_dn = torch.autograd.grad(T, z, grad_outputs=grad_T, create_graph=True)[0]
+        elif boundary_type == 'bottom':  # z = z_min
+            dT_dn = -torch.autograd.grad(T, z, grad_outputs=grad_T, create_graph=True)[0]
+        elif boundary_type == 'left':  # x = x_min
+            dT_dn = -torch.autograd.grad(T, x, grad_outputs=grad_T, create_graph=True)[0]
+        elif boundary_type == 'right':  # x = x_max
+            dT_dn = torch.autograd.grad(T, x, grad_outputs=grad_T, create_graph=True)[0]
+        elif boundary_type == 'front':  # y = y_min
+            dT_dn = -torch.autograd.grad(T, y, grad_outputs=grad_T, create_graph=True)[0]
+        elif boundary_type == 'back':  # y = y_max
+            dT_dn = torch.autograd.grad(T, y, grad_outputs=grad_T, create_graph=True)[0]
+        else:
+            raise ValueError(f"Unknown boundary type: {boundary_type}")
+        
+        # Get thermal conductivity at boundary
+        k = self._thermal_conductivity(T)
+        
+        # Compute heat flux terms
+        # Convection: qc = h(T-T∞) - Eq. (3b)
+        q_c = self.h_c * (T - self.T_ambient)
+        
+        # Radiation: qr = εσ(T⁴-T∞⁴) - Eq. (3c)
+        q_r = self.epsilon * self.sigma * (T**4 - self.T_ambient**4)
+        
+        # Robin boundary condition: k∂T/∂n + qc + qr = 0
+        # Simplified to check if heat flux from conduction balances convection and radiation
+        bc_residual = k * dT_dn + q_c + q_r
+        
+        # Scale to prevent extreme values
+        bc_residual = bc_residual / (self.h_c * self.T_ref + 1e-6)
+        
+        return bc_residual, T
+    
+    def set_stage(self, stage):
+        """Set the simulation stage (deposition or cooling)"""
+        self.stage = stage
+        return self
+
+
+def generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage='deposition',focus_near_laser=False):
+    """Generate a simple grid of points for training"""
+    x_min, x_max = domain_bounds['x_min'], domain_bounds['x_max']
+    y_min, y_max = domain_bounds['y_min'], domain_bounds['y_max']
+    z_min, z_max = domain_bounds['z_min'], domain_bounds['z_max']
+    t_min = domain_bounds['t_min']
+    t_max = domain_bounds['t_max_deposition'] if stage == 'deposition' else domain_bounds['t_max_cooling']
+    
+    if focus_near_laser and stage == 'deposition':
+        standard_points = []
+        x_standard = np.linspace(x_min, x_max, nx)
+        y_standard = np.linspace(y_min, y_max, ny)
+        z_standard = np.linspace(z_min, z_max, nz)
+        t_standard = np.linspace(t_min, t_max, nt)
+        X, Y, Z, T = np.meshgrid(x_standard, y_standard, z_standard, t_standard, indexing='ij')
+        standard_points = np.stack([X.flatten(), Y.flatten(), Z.flatten(), T.flatten()], axis=1)
+        
+        # Add concentrated points near the laser path
+        # Define laser path (typically along y = 0.01)
+        laser_y = 0.01  # Center y-position of laser path
+        # Create concentrated grid near laser path
+        n_dense = 20  # Number of dense points in each dimension
+        x_dense = np.linspace(x_min, x_max, n_dense * 2)  # More points along x-direction
+        # Create narrow band around laser path
+        y_margin = 0.003  # 3mm margin around laser path
+        y_min_dense = max(y_min, laser_y - y_margin)
+        y_max_dense = min(y_max, laser_y + y_margin)
+        y_dense = np.linspace(y_min_dense, y_max_dense, n_dense)
+        
+        # Focus on surface and near-surface
+        z_dense = np.linspace(z_min, min(0.002, z_max), n_dense)
+        
+        # Create concentrated time points
+        t_dense = np.linspace(t_min, t_max, n_dense)
+        
+        # Create meshgrid for dense points
+        X_dense, Y_dense, Z_dense, T_dense = np.meshgrid(x_dense, y_dense, z_dense, t_dense, indexing='ij')
+        dense_points = np.stack([X_dense.flatten(), Y_dense.flatten(), Z_dense.flatten(), T_dense.flatten()], axis=1)
+        
+        # Combine standard and dense points
+        points = np.vstack([standard_points, dense_points])
+        
+        # Remove duplicates
+        points = np.unique(points, axis=0)
+        
+    else:
+        # Create regular grid for cooling or when no laser path focus is needed
+        x = np.linspace(x_min, x_max, nx)
+        y = np.linspace(y_min, y_max, ny)
+        z = np.linspace(z_min, z_max, nz)
+        t = np.linspace(t_min, t_max, nt)
+        
+        X, Y, Z, T = np.meshgrid(x, y, z, t, indexing='ij')
+        points = np.stack([X.flatten(), Y.flatten(), Z.flatten(), T.flatten()], axis=1)
+    
+    return torch.tensor(points, dtype=torch.float32)
+    
+
+
+def train_simplified_pinn(model, domain_bounds, epochs=200, lr=1e-4, points_per_batch=1000, 
+                          lambda_pde=1.0, lambda_ic=0.1, lambda_bc=0.1, focus_near_laser=False):
+    """
+    Train the simplified PINN model
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    # Generate training points
+    print("Generating training points...")
+    points = generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage=model.stage , focus_near_laser=focus_near_laser)
+    num_points = points.shape[0]
+    print(f"Generated {num_points} points")
+    
+    # Generate boundary points
+    boundary_points = {}
+    
+    # Bottom (z=z_min)
+    mask = np.abs(points[:, 2] - domain_bounds['z_min']) < 1e-6
+    boundary_points['bottom'] = points[mask]
+    
+    # Top (z=z_max)
+    mask = np.abs(points[:, 2] - domain_bounds['z_max']) < 1e-6
+    boundary_points['top'] = points[mask]
+    
+    # Initial condition (t=t_min)
+    mask = np.abs(points[:, 3] - domain_bounds['t_min']) < 1e-6
+    boundary_points['initial'] = points[mask]
+    
+    # Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Training loop
+    print(f"Starting training for {epochs} epochs...")
+    for epoch in range(epochs):
+        model.train()
+        
+        # Shuffle points
+        idx = torch.randperm(num_points)
+        points = points[idx]
+        
+        # Process in batches
+        total_loss = 0.0
+        num_batches = num_points // points_per_batch
+        
+        for i in range(num_batches):
+            start_idx = i * points_per_batch
+            end_idx = start_idx + points_per_batch
+            batch_points = points[start_idx:end_idx].to(device)
+            
+            optimizer.zero_grad()
+            
+            # Extract coordinates
+            x, y, z, t = batch_points[:, 0:1], batch_points[:, 1:2], batch_points[:, 2:3], batch_points[:, 3:4]
+            
+            # Compute PDE residual
+            pde_residual, T_pred = model.compute_pde_residual(x, y, z, t)
+            pde_loss = torch.mean(pde_residual**2)
+            
+            # Initial condition loss
+            ic_points = boundary_points['initial'][:min(1000, len(boundary_points['initial']))].to(device)
+            x_ic, y_ic, z_ic, t_ic = ic_points[:, 0:1], ic_points[:, 1:2], ic_points[:, 2:3], ic_points[:, 3:4]
+            
+            if model.stage == 'cooling':
+                # For cooling stage, initial condition should match final state of deposition
+                t_final_dep = torch.ones_like(t_ic) * domain_bounds['t_max_deposition']
+                # Here we assume the model itself can predict the temperature at the end of deposition
+                with torch.no_grad():
+                    T_final_dep = model(x_ic, y_ic, z_ic, t_final_dep)
+                    
+                T_ic = model(x_ic, y_ic, z_ic, t_ic)
+                ic_loss = torch.mean((T_ic - T_final_dep)**2) / (torch.mean(T_final_dep**2))
+            else:
+                # Original deposition initial condition (ambient temperature)
+                T_ic = model(x_ic, y_ic, z_ic, t_ic)
+                ic_loss = torch.mean((T_ic - model.T_ambient)**2) / (model.T_ambient**2)
+            
+            
+        
+            
+            # Boundary condition loss - top surface
+            bc_points = boundary_points['top'][:min(1000, len(boundary_points['top']))].to(device)
+            x_bc, y_bc, z_bc, t_bc = bc_points[:, 0:1], bc_points[:, 1:2], bc_points[:, 2:3], bc_points[:, 3:4]
+            bc_residual, _ = model.compute_bc_residual(x_bc, y_bc, z_bc, t_bc, 'top')
+            bc_loss = torch.mean(bc_residual**2)
+            
+            # Total loss
+            loss = lambda_pde * pde_loss + lambda_ic * ic_loss + lambda_bc * bc_loss
+            
+            # Backpropagation
+            loss.backward()
+            
+            # Clip gradients to prevent instability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            total_loss += loss.item()
+        
+        # Print progress
+        if epoch % 10 == 0 or epoch == epochs - 1:
+            avg_loss = total_loss / num_batches
+            print(f"Epoch {epoch}, Loss: {avg_loss:.6f}")
+            
+            # Sample temperature prediction
+            with torch.no_grad():
+                test_point = torch.tensor([[0.02, 0.01, 0.0, 1.0]], dtype=torch.float32).to(device)
+                test_temp = model(test_point[:, 0:1], test_point[:, 1:2], test_point[:, 2:3], test_point[:, 3:4])
+                print(f"Temperature at x=0.02, y=0.01, z=0.0, t=1.0: {test_temp.item():.2f} K")
+                
+                # Point near laser path
+                test_point = torch.tensor([[0.01, 0.01, 0.0, 1.0]], dtype=torch.float32).to(device)
+                test_temp = model(test_point[:, 0:1], test_point[:, 1:2], test_point[:, 2:3], test_point[:, 3:4])
+                print(f"Temperature near laser path at x=0.01, y=0.01, z=0.0, t=1.0: {test_temp.item():.2f} K")
+    
+    print("Training completed.")
+    return model
