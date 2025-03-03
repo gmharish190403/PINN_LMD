@@ -131,7 +131,7 @@ class SimplifiedPINN(nn.Module):
         
         # Direct mapping to temperature (ambient + learned change)
         # Simple scaling with larger range to capture high temperatures
-        T = self.T_ambient + 2500.0 * torch.sigmoid(output)
+        T = self.T_ambient + 2000.0 * torch.sigmoid(output)
         
         return T
     
@@ -334,7 +334,7 @@ class SimplifiedPINN(nn.Module):
         return self
 
 
-def generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage='deposition',focus_near_laser=False):
+def generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage='deposition'):
     """Generate a simple grid of points for training"""
     x_min, x_max = domain_bounds['x_min'], domain_bounds['x_max']
     y_min, y_max = domain_bounds['y_min'], domain_bounds['y_max']
@@ -342,59 +342,23 @@ def generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage='depos
     t_min = domain_bounds['t_min']
     t_max = domain_bounds['t_max_deposition'] if stage == 'deposition' else domain_bounds['t_max_cooling']
     
-    if focus_near_laser and stage == 'deposition':
-        standard_points = []
-        x_standard = np.linspace(x_min, x_max, nx)
-        y_standard = np.linspace(y_min, y_max, ny)
-        z_standard = np.linspace(z_min, z_max, nz)
-        t_standard = np.linspace(t_min, t_max, nt)
-        X, Y, Z, T = np.meshgrid(x_standard, y_standard, z_standard, t_standard, indexing='ij')
-        standard_points = np.stack([X.flatten(), Y.flatten(), Z.flatten(), T.flatten()], axis=1)
-        
-        # Add concentrated points near the laser path
-        # Define laser path (typically along y = 0.01)
-        laser_y = 0.01  # Center y-position of laser path
-        # Create concentrated grid near laser path
-        n_dense = 20  # Number of dense points in each dimension
-        x_dense = np.linspace(x_min, x_max, n_dense * 2)  # More points along x-direction
-        # Create narrow band around laser path
-        y_margin = 0.003  # 3mm margin around laser path
-        y_min_dense = max(y_min, laser_y - y_margin)
-        y_max_dense = min(y_max, laser_y + y_margin)
-        y_dense = np.linspace(y_min_dense, y_max_dense, n_dense)
-        
-        # Focus on surface and near-surface
-        z_dense = np.linspace(z_min, min(0.002, z_max), n_dense)
-        
-        # Create concentrated time points
-        t_dense = np.linspace(t_min, t_max, n_dense)
-        
-        # Create meshgrid for dense points
-        X_dense, Y_dense, Z_dense, T_dense = np.meshgrid(x_dense, y_dense, z_dense, t_dense, indexing='ij')
-        dense_points = np.stack([X_dense.flatten(), Y_dense.flatten(), Z_dense.flatten(), T_dense.flatten()], axis=1)
-        
-        # Combine standard and dense points
-        points = np.vstack([standard_points, dense_points])
-        
-        # Remove duplicates
-        points = np.unique(points, axis=0)
-        
-    else:
-        # Create regular grid for cooling or when no laser path focus is needed
-        x = np.linspace(x_min, x_max, nx)
-        y = np.linspace(y_min, y_max, ny)
-        z = np.linspace(z_min, z_max, nz)
-        t = np.linspace(t_min, t_max, nt)
-        
-        X, Y, Z, T = np.meshgrid(x, y, z, t, indexing='ij')
-        points = np.stack([X.flatten(), Y.flatten(), Z.flatten(), T.flatten()], axis=1)
+    # Create grid
+    x = np.linspace(x_min, x_max, nx)
+    y = np.linspace(y_min, y_max, ny)
+    z = np.linspace(z_min, z_max, nz)
+    t = np.linspace(t_min, t_max, nt)
+    
+    # Create meshgrid
+    X, Y, Z, T = np.meshgrid(x, y, z, t, indexing='ij')
+    
+    # Reshape to points
+    points = np.stack([X.flatten(), Y.flatten(), Z.flatten(), T.flatten()], axis=1)
     
     return torch.tensor(points, dtype=torch.float32)
-    
 
 
-def train_simplified_pinn(model, domain_bounds, epochs=200, lr=1e-4, points_per_batch=1000, 
-                          lambda_pde=1.0, lambda_ic=0.1, lambda_bc=0.1, focus_near_laser=False):
+def train_simplified_pinn(model, domain_bounds, epochs=100, lr=1e-4, points_per_batch=1000, 
+                          lambda_pde=1.0, lambda_ic=0.1, lambda_bc=0.1):
     """
     Train the simplified PINN model
     """
@@ -403,7 +367,7 @@ def train_simplified_pinn(model, domain_bounds, epochs=200, lr=1e-4, points_per_
     
     # Generate training points
     print("Generating training points...")
-    points = generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage=model.stage , focus_near_laser=focus_near_laser)
+    points = generate_grid_points(domain_bounds, nx=20, ny=20, nz=10, nt=10, stage=model.stage)
     num_points = points.shape[0]
     print(f"Generated {num_points} points")
     
@@ -455,23 +419,8 @@ def train_simplified_pinn(model, domain_bounds, epochs=200, lr=1e-4, points_per_
             # Initial condition loss
             ic_points = boundary_points['initial'][:min(1000, len(boundary_points['initial']))].to(device)
             x_ic, y_ic, z_ic, t_ic = ic_points[:, 0:1], ic_points[:, 1:2], ic_points[:, 2:3], ic_points[:, 3:4]
-            
-            if model.stage == 'cooling':
-                # For cooling stage, initial condition should match final state of deposition
-                t_final_dep = torch.ones_like(t_ic) * domain_bounds['t_max_deposition']
-                # Here we assume the model itself can predict the temperature at the end of deposition
-                with torch.no_grad():
-                    T_final_dep = model(x_ic, y_ic, z_ic, t_final_dep)
-                    
-                T_ic = model(x_ic, y_ic, z_ic, t_ic)
-                ic_loss = torch.mean((T_ic - T_final_dep)**2) / (torch.mean(T_final_dep**2))
-            else:
-                # Original deposition initial condition (ambient temperature)
-                T_ic = model(x_ic, y_ic, z_ic, t_ic)
-                ic_loss = torch.mean((T_ic - model.T_ambient)**2) / (model.T_ambient**2)
-            
-            
-        
+            T_ic = model(x_ic, y_ic, z_ic, t_ic)
+            ic_loss = torch.mean((T_ic - model.T_ambient)**2) / (model.T_ambient**2)
             
             # Boundary condition loss - top surface
             bc_points = boundary_points['top'][:min(1000, len(boundary_points['top']))].to(device)
